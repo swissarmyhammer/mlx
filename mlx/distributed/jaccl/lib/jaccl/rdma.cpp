@@ -113,7 +113,8 @@ Connection::Connection(ibv_context* ctx_)
     : ctx(ctx_),
       protection_domain(nullptr),
       completion_queue(nullptr),
-      queue_pair(nullptr) {
+      queue_pair(nullptr),
+      gid_index(-1) {
   src.local_id = -1;
 }
 
@@ -123,6 +124,7 @@ Connection::Connection(Connection&& c) : Connection(nullptr) {
   std::swap(completion_queue, c.completion_queue);
   std::swap(queue_pair, c.queue_pair);
   std::swap(src, c.src);
+  std::swap(gid_index, c.gid_index);
 }
 
 Connection::~Connection() {
@@ -188,28 +190,22 @@ const Destination& Connection::info() {
 
   ibv_port_attr port_attr;
   ibv().query_port(ctx, 1, &port_attr);
+  // Prefer an IPv4-mapped GID. A Thunderbolt port publishes one only when the
+  // interface itself has an IPv4 address, which it doesn't while it is a
+  // member of the Thunderbolt Bridge. Without one the GID stays zero, and
+  // queue_pair_rtr addresses the peer by LID (is_global = 0). Thunderbolt
+  // links are point-to-point, so the LID is enough.
   ibv_gid gid = {};
-  bool found_gid = false;
   for (int i = 0; i < port_attr.gid_tbl_len; i++) {
     ibv_gid tmp;
     if (ibv().query_gid(ctx, 1, i, &tmp) == 0) {
       if (*(uint64_t*)&tmp.raw[0] == 0 && *(uint16_t*)&tmp.raw[8] == 0 &&
           *(uint16_t*)&tmp.raw[10] == 0xffff) {
         gid = tmp;
-        found_gid = true;
+        gid_index = i;
         break;
       }
     }
-  }
-
-  // Fail here rather than hand an unset GID to the queue pair.
-  if (!found_gid) {
-    std::ostringstream msg;
-    msg << "[jaccl] No IPv4-mapped GID for this device. Thunderbolt RDMA ports "
-        << "only publish one once the interface has an IPv4 address; assign a "
-        << "link-local address to it, for example: ifconfig <interface> inet "
-        << "169.254.0.1 netmask 255.255.0.0 alias";
-    throw std::runtime_error(msg.str());
   }
 
   src.local_id = port_attr.lid;
@@ -251,11 +247,14 @@ void Connection::queue_pair_rtr(const Destination& dst) {
   attr.ah_attr.port_num = 1;
   attr.ah_attr.is_global = 0;
 
-  if (dst.global_identifier.global.interface_id) {
+  // Use the global route header only when both ends have a GID, and then
+  // from the GID this end published (not a fixed table index). Otherwise
+  // address the peer by LID.
+  if (gid_index >= 0 && dst.global_identifier.global.interface_id) {
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.hop_limit = 1;
     attr.ah_attr.grh.dgid = dst.global_identifier;
-    attr.ah_attr.grh.sgid_index = 1;
+    attr.ah_attr.grh.sgid_index = gid_index;
   }
 
   int mask = IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |

@@ -159,6 +159,9 @@ struct Connection {
   ibv_cq* completion_queue;
   ibv_qp* queue_pair;
   Destination src; // holds the local information
+  // Index of src.global_identifier in the port's GID table, or -1 when the
+  // port has no IPv4-mapped GID and the connection addresses its peer by LID.
+  int gid_index;
 
   Connection(ibv_context* ctx_);
   Connection(Connection&& c);

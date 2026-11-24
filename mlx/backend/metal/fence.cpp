@@ -9,6 +9,80 @@
 
 namespace mlx::core {
 
+namespace {
+
+// The fence kernels, compiled at run time. fence.metal needs Metal 3.2
+// (`coherent(system)`, `thread_scope_system`), and builds that compile the
+// kernel library without it (SwiftPM, which has no per-file Metal language
+// setting) leave these kernels out of default.metallib. Building them here
+// with the device's newest language version makes MLX_METAL_FAST_SYNCH work
+// in every build. When default.metallib has them too, this copy is unused
+// duplication, not a conflict.
+constexpr const char* fence_kernels_source = R"FENCE(
+// Copyright © 2024 Apple Inc.
+
+#pragma METAL internals : enable
+
+#ifndef __METAL_MEMORY_SCOPE_SYSTEM__
+#define __METAL_MEMORY_SCOPE_SYSTEM__ 3
+#endif
+namespace metal {
+constexpr constant metal::thread_scope thread_scope_system =
+    static_cast<thread_scope>(__METAL_MEMORY_SCOPE_SYSTEM__);
+}
+
+#include <metal_atomic>
+
+[[kernel]] void input_coherent(
+    volatile coherent(system) device uint* input [[buffer(0)]],
+    const constant uint& size [[buffer(1)]],
+    uint index [[thread_position_in_grid]]) {
+  if (index < size) {
+    input[index] = input[index];
+  }
+  metal::atomic_thread_fence(
+      metal::mem_flags::mem_device,
+      metal::memory_order_seq_cst,
+      metal::thread_scope_system);
+}
+
+// single thread kernel to update timestamp
+[[kernel]] void fence_update(
+    volatile coherent(system) device uint* timestamp [[buffer(0)]],
+    constant uint& value [[buffer(1)]]) {
+  timestamp[0] = value;
+  metal::atomic_thread_fence(
+      metal::mem_flags::mem_device,
+      metal::memory_order_seq_cst,
+      metal::thread_scope_system);
+}
+
+// single thread kernel to spin wait for timestamp value
+[[kernel]] void fence_wait(
+    volatile coherent(system) device uint* timestamp [[buffer(0)]],
+    constant uint& value [[buffer(1)]]) {
+  while (1) {
+    metal::atomic_thread_fence(
+        metal::mem_flags::mem_device,
+        metal::memory_order_seq_cst,
+        metal::thread_scope_system);
+    if (timestamp[0] >= value) {
+      break;
+    }
+  }
+}
+)FENCE";
+
+MTL::ComputePipelineState* get_fence_kernel(
+    metal::Device& d,
+    const std::string& name) {
+  auto lib = d.get_library(
+      "mlx_fence_kernels", [] { return std::string(fence_kernels_source); });
+  return d.get_kernel(name, lib);
+}
+
+} // namespace
+
 struct FenceImpl {
   FenceImpl(Stream stream) {
     auto d = metal::device(stream.device).mtl_device();
@@ -72,7 +146,7 @@ void Fence::wait(Stream stream, const array& x, uint32_t value) {
   // output starts before this one is done
   compute_encoder.register_output_array(x);
 
-  auto kernel = d.get_kernel("fence_wait");
+  auto kernel = get_fence_kernel(d, "fence_wait");
   MTL::Size kernel_dims = MTL::Size(1, 1, 1);
   compute_encoder.set_compute_pipeline_state(kernel);
 
@@ -108,7 +182,7 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
 
   // Launch input visibility kernels
   if (cross_device) {
-    auto kernel = d.get_kernel("input_coherent");
+    auto kernel = get_fence_kernel(d, "input_coherent");
     uint32_t nthreads = (x.data_size() * x.itemsize() + sizeof(uint32_t) - 1) /
         sizeof(uint32_t);
     MTL::Size group_dims = MTL::Size(1024, 1, 1);
@@ -123,7 +197,7 @@ uint32_t Fence::update(Stream stream, const array& x, bool cross_device) {
   compute_encoder.barrier();
 
   // Launch value update kernel
-  auto kernel = d.get_kernel("fence_update");
+  auto kernel = get_fence_kernel(d, "fence_update");
   MTL::Size kernel_dims = MTL::Size(1, 1, 1);
   compute_encoder.set_compute_pipeline_state(kernel);
 

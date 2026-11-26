@@ -2342,6 +2342,50 @@ class TestQuantized(mlx_tests.MLXTestCase):
                     tol = 1e-3 if on_gpu else 1.5e-5
                     self.assertLess((y_sorted - y_unsorted).abs().max(), tol)
 
+    def test_gather_qmm_sorted_unaligned_k_reads_inside_buffers(self):
+        # In the tail of an unaligned K the NAX loaders dequantized the whole tile
+        # depth, so for the last row of the last expert they read past the end of
+        # the weights and the scales (and biases). A NaN scale past the end turned
+        # into a NaN output, though the zero-padded x multiplies those columns.
+        # Here the bytes after each buffer are 0xFF, a NaN scale in every format.
+        E, N, L = 4, 64, 80
+        key = mx.random.key(0)
+        k1, k2 = mx.random.split(key)
+        dtype = mx.bfloat16 if mx.default_device() == mx.gpu else mx.float32
+        guard_bytes = 4096
+
+        def followed_by(a, fill):
+            data = mx.flatten(a).view(mx.uint8)
+            guard = mx.full((guard_bytes,), fill, dtype=mx.uint8)
+            padded = mx.concatenate([data, guard])
+            mx.eval(padded)
+            return padded[: data.size].view(a.dtype).reshape(a.shape)
+
+        indices = mx.array([i * E // L for i in range(L)], dtype=mx.uint32)
+        for mode, group_size in (("affine", 32), ("nvfp4", 16)):
+            for K in (32, 96):
+                with self.subTest(mode=mode, K=K):
+                    w = (mx.random.normal((E, N, K), key=k1) * 0.3).astype(dtype)
+                    x = mx.random.normal((L, 1, K), key=k2).astype(dtype)
+                    wq = mx.quantize(w, group_size=group_size, mode=mode)
+                    mx.eval(x, *wq)
+
+                    def run(fill):
+                        return mx.gather_qmm(
+                            x,
+                            *(followed_by(a, fill) for a in wq),
+                            group_size=group_size,
+                            mode=mode,
+                            transpose=True,
+                            rhs_indices=indices,
+                            sorted_indices=True,
+                        )
+
+                    zero_guard = run(0)
+                    nan_guard = run(0xFF)
+                    self.assertFalse(mx.any(mx.isnan(nan_guard)).item())
+                    self.assertTrue(mx.array_equal(zero_guard, nan_guard).item())
+
     @unittest.skipIf(not mx.cuda.is_available(), "CUDA kernel path only")
     def test_gather_qmm_sorted_rhs_cuda(self):
         # Sorted rows with a shared LHS take the sorted-RHS matrix kernel. Row
